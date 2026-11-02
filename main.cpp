@@ -19,6 +19,8 @@ const int TG22 = 13573; // tan(22.5 deg) * 2^15
 #define SIMD_WIDTH 32
 #define CACHE_LINE_WIDTH 64
 
+// #define SIMD_ENABLED
+
 // n must be a power of 2
 inline size_t align_size(size_t sz, int n)
 {
@@ -26,17 +28,6 @@ inline size_t align_size(size_t sz, int n)
 }
 
 // Target CPU: L1d cache 32Kb 8-way associativity
-
-/*
-_mm256_set1_epi32           port 5 // done once
-_mm256_load_si256           port 2 or 3
-_mm256_abs_epi16            port 1 or 5
-_mm256_add_epi32            port 1 or 5
-_mm256_store_si256          port 4 AND 7
-_mm256_loadu_si256          port 2 or 3
-_mm256_cmpgt_epi32          port 1 or 5
-_mm256_movemask_ps          port 0
-*/
 
 /**
  * @param boundary_top top row boundary (inclusive)
@@ -92,10 +83,10 @@ void nonmax(const int boundary_top,
 
     // constants in registers
     const __m256i v_low = _mm256_set1_epi16(low_thresh); // ymm0
-    const __m256i v_strong = _mm256_set1_epi16(2);       // ymm1
-    const __m256i v_weak = _mm256_set1_epi16(1);         // ymm2
-
-    long bin[17] = {0};
+    const __m256i v_high = _mm256_set1_epi16(high_thresh);
+    const __m256i v_zero = _mm256_setzero_si256();
+    const __m256i v_ones = _mm256_set1_epi16(-1);
+    const __m256i v_tg22 = _mm256_set1_epi32(TG22); // madd operand: (TG22, 0) per 32-bit lane
 
     for (int i = row_start; i <= boundary_bottom; ++i)
     {
@@ -117,6 +108,8 @@ void nonmax(const int boundary_top,
             __m256i v_dx1, v_dy1;
             __m256i v_dx2, v_dy2;
             __m256i v_dx3, v_dy3;
+
+#ifdef SIMD_ENABLED
 
             // simd by 64 shorts
             for (; j <= src_cols - 64; j += 64)
@@ -168,6 +161,7 @@ void nonmax(const int boundary_top,
                 _mm256_store_si256((__m256i *)(mag_next + j), _mm256_add_epi16(v_dx0, v_dy0));
             }
 
+#endif
             // scalar for remaining columns
             for (; j < src_cols; ++j)
                 mag_next[j] = std::abs((int)row_dx[j]) + std::abs((int)row_dy[j]);
@@ -190,95 +184,102 @@ void nonmax(const int boundary_top,
         const short *curr_dy = dy + (i - 1) * pmap_step;
 
         j = 0;
+
+#ifdef SIMD_ENABLED
+
         for (; j <= src_cols - 16; j += 16)
         {
-            __m256i v_mag_act0 = _mm256_loadu_si256((const __m256i *)(mag_act + j));
-            __m256i v_mag_act1 = _mm256_loadu_si256((const __m256i *)(mag_act + j + 16));
-            __m256i v_cmp = _mm256_cmpgt_epi16(v_mag_act0, v_low);
-            __m256i v_cmp = _mm256_cmpgt_epi16(v_mag_act1, v_low);
+            const __m256i v_m = _mm256_loadu_si256((const __m256i *)(mag_act + j));
+            const __m256i v_cand = _mm256_cmpgt_epi16(v_m, v_low);
 
-            if (_mm256_testz_si256(v_cmp, v_cmp)) // ignore if nothing is above threshold
+            // sparse fast path: most 16-pixel blocks have nothing above the low threshold
+            if (_mm256_testz_si256(v_cand, v_cand))
                 continue;
 
-            int mask = _mm256_movemask_epi8(v_cmp);
-            mask = _pext_u32(mask, 0x55555555u);
+            // ---- direction classification (16 lanes) ----
+            const __m256i v_dx = _mm256_load_si256((const __m256i *)(curr_dx + j));
+            const __m256i v_dy = _mm256_load_si256((const __m256i *)(curr_dy + j));
+            const __m256i v_ax = _mm256_abs_epi16(v_dx);
+            const __m256i v_ay = _mm256_abs_epi16(v_dy);
 
-            bin[_mm_popcnt_u32(mask)]++;
+            // Widen |dx|, |dy| to 32 bit (the fixed-point products need it).
+            // unpacklo/hi interleave within each 128-bit lane; packs_epi32 below undoes that
+            // exactly, so lane order is preserved without any cross-lane permute.
+            const __m256i ax_lo = _mm256_unpacklo_epi16(v_ax, v_zero);
+            const __m256i ax_hi = _mm256_unpackhi_epi16(v_ax, v_zero);
+            const __m256i ay_lo = _mm256_unpacklo_epi16(v_ay, v_zero);
+            const __m256i ay_hi = _mm256_unpackhi_epi16(v_ay, v_zero);
 
-            // total_masks++;
+            // x * TG22 (madd: upper 16 bits of each 32-bit lane are zero, so it is a plain multiply)
+            const __m256i tg22x_lo = _mm256_madd_epi16(ax_lo, v_tg22);
+            const __m256i tg22x_hi = _mm256_madd_epi16(ax_hi, v_tg22);
+            // y << 15
+            const __m256i y_lo = _mm256_slli_epi32(ay_lo, 15);
+            const __m256i y_hi = _mm256_slli_epi32(ay_hi, 15);
+            // tg67x = tg22x + (x << 16)
+            const __m256i tg67x_lo = _mm256_add_epi32(tg22x_lo, _mm256_slli_epi32(ax_lo, 16));
+            const __m256i tg67x_hi = _mm256_add_epi32(tg22x_hi, _mm256_slli_epi32(ax_hi, 16));
 
-            while (mask != 0)
+            // horizontal: y < tg22x      vertical: y > tg67x      (otherwise diagonal)
+            const __m256i is_h = _mm256_packs_epi32(_mm256_cmpgt_epi32(tg22x_lo, y_lo),
+                                                    _mm256_cmpgt_epi32(tg22x_hi, y_hi));
+            const __m256i is_v = _mm256_packs_epi32(_mm256_cmpgt_epi32(y_lo, tg67x_lo),
+                                                    _mm256_cmpgt_epi32(y_hi, tg67x_hi));
+            // diagonal sign: all-ones where (dx ^ dy) < 0, i.e. s == -1
+            const __m256i neg = _mm256_srai_epi16(_mm256_xor_si256(v_dx, v_dy), 15);
+
+            // ---- neighbour loads (unaligned, +-1 element) ----
+            const __m256i act_l = _mm256_loadu_si256((const __m256i *)(mag_act + j - 1));
+            const __m256i act_r = _mm256_loadu_si256((const __m256i *)(mag_act + j + 1));
+            const __m256i prev_c = _mm256_loadu_si256((const __m256i *)(mag_prev + j));
+            const __m256i prev_l = _mm256_loadu_si256((const __m256i *)(mag_prev + j - 1));
+            const __m256i prev_r = _mm256_loadu_si256((const __m256i *)(mag_prev + j + 1));
+            const __m256i next_c = _mm256_loadu_si256((const __m256i *)(mag_next + j));
+            const __m256i next_l = _mm256_loadu_si256((const __m256i *)(mag_next + j - 1));
+            const __m256i next_r = _mm256_loadu_si256((const __m256i *)(mag_next + j + 1));
+
+            // horizontal: m > act[k-1] && m >= act[k+1]   (m >= r  <=>  !(r > m))
+            const __m256i c_h = _mm256_andnot_si256(_mm256_cmpgt_epi16(act_r, v_m),
+                                                    _mm256_cmpgt_epi16(v_m, act_l));
+            // vertical: m > prev[k] && m >= next[k]
+            const __m256i c_v = _mm256_andnot_si256(_mm256_cmpgt_epi16(next_c, v_m),
+                                                    _mm256_cmpgt_epi16(v_m, prev_c));
+            // diagonal: m > prev[k-s] && m > next[k+s]
+            //   s = +1: prev_l, next_r      s = -1: prev_r, next_l
+            const __m256i p_d = _mm256_blendv_epi8(prev_l, prev_r, neg);
+            const __m256i n_d = _mm256_blendv_epi8(next_r, next_l, neg);
+            const __m256i c_d = _mm256_and_si256(_mm256_cmpgt_epi16(v_m, p_d),
+                                                 _mm256_cmpgt_epi16(v_m, n_d));
+
+            // select the condition matching each lane's direction
+            const __m256i is_d = _mm256_xor_si256(_mm256_or_si256(is_h, is_v), v_ones);
+            __m256i is_max = _mm256_or_si256(_mm256_and_si256(is_h, c_h),
+                                             _mm256_or_si256(_mm256_and_si256(is_v, c_v),
+                                                             _mm256_and_si256(is_d, c_d)));
+            is_max = _mm256_and_si256(is_max, v_cand); // m > low
+
+            const __m256i is_strong = _mm256_and_si256(is_max, _mm256_cmpgt_epi16(v_m, v_high));
+
+            // ---- write pmap: 0 / 1 (weak) / 2 (strong) ----
+            // 0xFFFF >> 15 == 1, so r = is_max?1:0 + is_strong?1:0
+            const __m256i r16 = _mm256_add_epi16(_mm256_srli_epi16(is_max, 15),
+                                                 _mm256_srli_epi16(is_strong, 15));
+            // 16 x u16 -> 16 x u8 (packus is per-128-bit-lane, so gather qwords 0 and 2)
+            const __m256i r8 = _mm256_permute4x64_epi64(_mm256_packus_epi16(r16, r16), 0x08);
+            _mm_storeu_si128((__m128i *)(pmap_row + j), _mm256_castsi256_si128(r8));
+
+            // ---- bit-scan only the strong pixels (sparse) to seed hysteresis ----
+            unsigned strong_bits = _pext_u32((unsigned)_mm256_movemask_epi8(is_strong), 0x55555555u);
+            while (strong_bits != 0)
             {
-                int l = __builtin_ctz(mask); // bit scan forward
-                mask &= mask - 1;            // clear lowest set bit
-
-                int k = j + l;
-
-                // TODO: check how to vectorize local max checks (perhaps using blend functions?)
-
-                int m = mag_act[k];
-                short xs = curr_dx[k];
-                short ys = curr_dy[k];
-                int x = (int)std::abs(xs);
-                int y = (int)std::abs(ys) << 15; // shift by 15 for fixed-point math
-                int tg22x = x * TG22;
-
-                // non-maximum suppression (NMS)
-                if (y < tg22x) // horizontal direction
-                {
-                    if (m > mag_act[k - 1] && m >= mag_act[k + 1])
-                    {
-                        if (m > high_thresh)
-                        {
-                            pmap_row[k] = 2;
-                            // CANNY_PUSH_STACK(_pmap_row + k, stack);
-                        }
-                        else
-                        {
-                            pmap_row[k] = 1;
-                        }
-                        continue;
-                    }
-                }
-                else
-                {
-                    int tg67x = tg22x + (x << 16); // fixed-point tan(67.5 deg) check
-                    if (y > tg67x)                 // vertical direction
-                    {
-                        if (m > mag_prev[k] && m >= mag_next[k])
-                        {
-                            if (m > high_thresh)
-                            {
-                                pmap_row[k] = 2;
-                                // CANNY_PUSH_STACK(_pmap_row + k, stack);
-                            }
-                            else
-                            {
-                                pmap_row[k] = 1;
-                            }
-                            continue;
-                        }
-                    }
-                    else // diagonal direction
-                    {
-                        int s = ((xs ^ ys) < 0) ? -1 : 1;
-                        if (m > mag_prev[k - s] && m > mag_next[k + s])
-                        {
-                            if (m > high_thresh)
-                            {
-                                pmap_row[k] = 2;
-                                // CANNY_PUSH_STACK(_pmap_row + k, stack);
-                            }
-                            else
-                            {
-                                pmap_row[k] = 1;
-                            }
-                            continue;
-                        }
-                    }
-                }
+                int l = __builtin_ctz(strong_bits);
+                strong_bits &= strong_bits - 1;
+                // CANNY_PUSH_STACK(pmap_row + j + l, stack);
+                (void)l;
             }
         }
+
+#endif
 
         // scalar loop for remaining elements
         for (; j < src_cols; j++)
@@ -350,12 +351,6 @@ void nonmax(const int boundary_top,
         }
     }
 
-    for (int i = 0; i < 17; i++)
-    {
-
-        std::cout << i << " " << bin[i] << "\n";
-    }
-
     _mm_free(buffer);
 }
 
@@ -367,6 +362,8 @@ bool is_aligned_64(const void *ptr)
 
 int main(int argc, char *argv[])
 {
+    unsigned long long t0, t1;
+
     if (argc < 3)
     {
         std::cerr << "Usage: canny <low_thresh> <high_thresh> <image-path> <output-path>\n";
@@ -405,15 +402,23 @@ int main(int argc, char *argv[])
     }
 
     cv::Mat gray, blurred, dx, dy, grad_mag, grad_phase, edges;
+    int src_rows = image.size[0];
+    int src_cols = image.size[1];
 
     // setup
     cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);      // gray is CV_8U
     cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 1); // blurred is CV_8U
+
+    t0 = rdtsc();
+    cv::Canny(gray, edges, low_thresh, high_thresh);
+    t1 = rdtsc();
+
+    std::cerr << "baseline pixels/cycle: " << (src_cols * src_rows) / ((double)(t1 - t0)) << "\n";
+
+    cv::imwrite(argv[4], edges);
+
     cv::Sobel(blurred, dx, CV_16S, 1, 0, 3);
     cv::Sobel(blurred, dy, CV_16S, 0, 1, 3);
-
-    int src_rows = image.size[0];
-    int src_cols = image.size[1];
 
     // Pad src_cols by 33 to 64 uchars. This makes room for the border pmap values.
     // This value is also used as the stride for dx, dy and pmap
@@ -467,14 +472,11 @@ int main(int argc, char *argv[])
     std::cerr << "src_rows: " << src_rows << "\n";
     std::cerr << "pmap_step: " << pmap_step << "\n";
 
-    unsigned long long t0, t1;
     t0 = rdtsc();
     nonmax(0, src_rows, src_cols, src_rows, pmap_step, dx_p, dy_p, pmap_p + SIMD_WIDTH, low_thresh, high_thresh);
     t1 = rdtsc();
 
-    // throughput ops/cycle
-    std::cerr << "cycles/pixel: " << ((double)(t1 - t0)) / (src_cols * src_rows) << "\n";
-    // std::cerr << "throughput: " << (src_cols * src_rows * 7) / ((double)(t1 - t0)) << "\n";
+    std::cerr << "pixels/cycle: " << (src_cols * src_rows) / ((double)(t1 - t0)) << "\n";
 
     cv::Mat result;
     pmap.convertTo(result, CV_8U, 127.0); // amplify pmap so we can see the edges
