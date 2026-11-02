@@ -19,7 +19,7 @@ const int TG22 = 13573; // tan(22.5 deg) * 2^15
 #define SIMD_WIDTH 32
 #define CACHE_LINE_WIDTH 64
 
-// #define SIMD_ENABLED
+#define SIMD_ENABLED
 
 // n must be a power of 2
 inline size_t align_size(size_t sz, int n)
